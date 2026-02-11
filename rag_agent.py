@@ -1,111 +1,67 @@
-import sqlite3
-import google.generativeai as genai
+from supabase import create_client, Client
+import re
+from typing import List, Dict, Optional
 
-# --- Configuration ---
-DATABASE_FILE = 'knowledge.db'
+SUPABASE_URL = "https://ifbknohkqfqplwvocksc.supabase.co"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImlmYmtub2hrcWZxcGx3dm9ja3NjIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTg4NjIyMjIsImV4cCI6MjA3NDQzODIyMn0.a5motl3g-arn6B-_JmL4J6WhmwacAkesfW1LnD52FQY"
 
-# 1. Paste your API key here
-GOOGLE_API_KEY = 'AIzaSyBQ3q7XhOJF_try80r5WcVaCNmrH09Ix4E'
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# 2. Setup the AI model
-genai.configure(api_key=GOOGLE_API_KEY)
-model = genai.GenerativeModel('models/gemini-2.5-pro')
+STOP_WORDS = {
+    "kya", "hai", "he", "ka", "ki", "ke", "ko", "se", "me", "mein",
+    "what", "is", "the", "a", "an", "of", "define", "explain",
+    "tell", "me", "about", "how", "to", "in", "are", "and",
+    "or", "but", "for", "on", "with", "as", "by", "from", "do"
+}
 
-# --- Part 1: The Retriever (Your old function) ---
-def search_knowledge_base(query):
-    """
-    Searches the database for relevant text chunks.
-    """
-    conn = sqlite3.connect(DATABASE_FILE)
-    cursor = conn.cursor()
-    search_term = f"%{query}%"
-    
-    # We select the whole chunk
-    cursor.execute(
-        "SELECT text_chunk FROM knowledge WHERE text_chunk LIKE ?", 
-        (search_term,)
-    )
-    
-    results = cursor.fetchall()
-    conn.close()
-    
-    if results:
-        # Combine the text from all results
-        # We'll just use the first result for this simple test
-        return results[0][0]
-    else:
-        return None
 
-# --- Part 2: The Generator (The new AI function) ---
-def generate_answer(context, question):
-    """
-    Generates an answer using the AI model based on the context.
-    """
-    if context:
-        # This is the "RAG" prompt.
-        # It tells the AI to answer USING ONLY the provided text.
-        prompt = f"""You are a helpful assistant for a 9th-class student.
-        Answer the user's question **using only the following text**.
-        Do not add any information from the internet.
+def extract_keywords(question: str) -> List[str]:
+    """Extract meaningful keywords"""
+    text = re.sub(r"[^\w\s]", " ", question.lower())
+    words = text.split()
+    keywords = [w for w in words if w not in STOP_WORDS and len(w) > 2]
+    return keywords[:2]
 
-        Source Text:
-        "{context}"
 
-        User's Question:
-        "{question}"
-        """
-    else:
-        # This is the "Fallback" prompt.
-        # It's used when we find nothing in our database.
-        prompt = f"""You are a helpful assistant. The user's question was not found in their 
-        study notes. Please provide a general, helpful answer to their question:
-        
-        "{question}"
-        """
-    
+def search_supabase(question: str) -> Optional[Dict]:
+    """Search database and return complete info with metadata"""
     try:
-        response = model.generate_content(prompt)
-        return response.text
+        keywords = extract_keywords(question)
+        
+        if not keywords:
+            return None
+        
+        # Search with first keyword
+        query = supabase.table("knowledge").select("text_chunk, subject, source_file")
+        query = query.ilike("text_chunk", f"%{keywords[0]}%")
+        
+        res = query.limit(1).execute()
+        
+        if not res.data:
+            return None
+        
+        result = res.data[0]
+        
+        # Clean the text
+        text = result['text_chunk']
+        cleaned = ' '.join(text.split())
+        
+        # Take more text (600 characters for better content)
+        if len(cleaned) > 600:
+            # Find last complete sentence within 600 chars
+            truncated = cleaned[:600]
+            last_period = truncated.rfind('.')
+            if last_period > 400:  # If there's a sentence end
+                cleaned = truncated[:last_period + 1]
+            else:
+                cleaned = truncated + "..."
+        
+        return {
+            "text": cleaned,
+            "subject": result.get('subject', 'Biology'),
+            "source_file": result.get('source_file', '9th Class Textbook')
+        }
+        
     except Exception as e:
-        return f"Error: Could not generate answer. {e}"
-
-
-# --- Main Program: Run the RAG pipeline ---
-if __name__ == '__main__':
-    
-    # --- Test with a question IN your database ---
-    user_question_1 = "What is Biology?"
-    
-    print(f"--- Question 1: {user_question_1} ---")
-    
-    # 1. Retrieve
-    print("Step 1: Searching database...")
-    context = search_knowledge_base(user_question_1)
-    
-    # 2. Generate
-    if context:
-        print("Step 2: Found context. Generating answer...")
-    else:
-        print("Step 2: No context found. Using fallback...")
-        
-    answer_1 = generate_answer(context, user_question_1)
-    print(f"\nAI Answer:\n{answer_1}\n")
-
-    
-    # --- Test with a question NOT in your database ---
-    user_question_2 = "What is the capital of France?"
-    
-    print(f"--- Question 2: {user_question_2} ---")
-    
-    # 1. Retrieve
-    print("Step 1: Searching database...")
-    context_2 = search_knowledge_base(user_question_2)
-    
-    # 2. Generate
-    if context_2:
-        print("Step 2: Found context. Generating answer...")
-    else:
-        print("Step 2: No context found. Using fallback...")
-        
-    answer_2 = generate_answer(context_2, user_question_2)
-    print(f"\nAI Answer:\n{answer_2}\n")
+        print(f"Search error: {e}")
+        return None
